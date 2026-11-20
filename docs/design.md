@@ -38,6 +38,7 @@ erDiagram
         bigint expected_amount "予定支払額（円）"
         bigint paid_amount "実支払額（円・デフォルト0）"
         varchar status "PENDING | REPORTED | PAID | OVERDUE"
+        text report_note "支払者による振込報告メモ"
         timestamp reported_at "振込報告日時（支払者操作）"
         timestamp approved_at "着金承認日時（債権者操作）"
         timestamp created_at "作成日時"
@@ -49,9 +50,12 @@ erDiagram
         uuid payment_id FK "支払ID"
         date notified_date "通知実行日（YYYY-MM-DD）"
         varchar notification_type "DUE_TODAY | OVERDUE_REMIND"
-        varchar delivery_status "SENT | FAILED"
+        varchar delivery_status "PENDING | SENT | FAILED | UNKNOWN"
+        uuid line_retry_key "LINE API冪等リトライキー（X-Line-Retry-Key）"
+        int retry_count "再試行回数（デフォルト0）"
         text message_body "送信メッセージ本文"
-        timestamp created_at "送信日時"
+        timestamp created_at "作成日時"
+        timestamp updated_at "更新日時"
     }
 ```
 
@@ -87,8 +91,9 @@ erDiagram
 | `target_month` | `INT` | NO | - | `CHECK (target_month BETWEEN 1 AND 12)` |
 | `due_date` | `DATE` | NO | - | **月末営業日ロジックで算出された支払期日** |
 | `expected_amount` | `BIGINT` | NO | - | 当月の請求元本（円） |
-| `paid_amount` | `BIGINT` | NO | `0` | 承認済みの支払額（円） |
+| `paid_amount` | `BIGINT` | NO | `0` | 承認済みの累計支払額（円） |
 | `status` | `VARCHAR(32)` | NO | `'PENDING'` | `'PENDING'`, `'REPORTED'`, `'PAID'`, `'OVERDUE'` |
+| `report_note` | `TEXT` | YES | `NULL` | 支払者が振込報告時に入力したメモ（`POST /report` で保存） |
 | `reported_at` | `TIMESTAMPTZ` | YES | `NULL` | 支払者が「振込完了報告」を行った日時 |
 | `approved_at` | `TIMESTAMPTZ` | YES | `NULL` | 債権者が「着金確認・承認」を行った日時 |
 | `created_at` | `TIMESTAMPTZ` | NO | `NOW()` | 作成日時 |
@@ -97,7 +102,7 @@ erDiagram
 * **複合ユニーク制約**: `UNIQUE (contract_id, target_year, target_month)` （同一契約で同じ年月のレコード重複を防止）
 
 #### ③ `notification_logs`（通知履歴・二重送信防止テーブル）
-CronバッチによるLINE通知の送信履歴を記録し、**同日の二重通知（冪等性）をDBレベルで担保**するテーブル。
+CronバッチによるLINE通知の送信権予約と送信履歴を記録し、**同日の二重通知（冪等性）をDBレベルで担保**するテーブル。
 
 | カラム名 | データ型 | NULL | デフォルト | 制約・説明 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -105,12 +110,15 @@ CronバッチによるLINE通知の送信履歴を記録し、**同日の二重�
 | `payment_id` | `UUID` | NO | - | FOREIGN KEY (`payments.id`) ON DELETE CASCADE |
 | `notified_date` | `DATE` | NO | - | 通知実行日（JSTの `YYYY-MM-DD`） |
 | `notification_type` | `VARCHAR(32)` | NO | - | `'DUE_TODAY'`（期日当日） / `'OVERDUE_REMIND'`（延滞督促） |
-| `delivery_status` | `VARCHAR(32)` | NO | `'SENT'` | `'SENT'`（送信成功） / `'FAILED'`（送信失敗） |
-| `message_body` | `TEXT` | NO | - | 実際に送信したメッセージ内容 |
+| `delivery_status` | `VARCHAR(32)` | NO | `'PENDING'` | `'PENDING'`（送信予約） / `'SENT'`（送信成功） / `'FAILED'`（送信失敗） / `'UNKNOWN'`（結果不明） |
+| `line_retry_key` | `UUID` | NO | `gen_random_uuid()` | LINE Messaging API の `X-Line-Retry-Key` に指定する冪等キー |
+| `retry_count` | `INT` | NO | `0` | 再試行回数 |
+| `message_body` | `TEXT` | NO | - | 実際に送信するメッセージ内容 |
 | `created_at` | `TIMESTAMPTZ` | NO | `NOW()` | 作成日時 |
+| `updated_at` | `TIMESTAMPTZ` | NO | `NOW()` | 更新日時 |
 
 * **複合ユニーク制約（冪等性の要）**: `UNIQUE (payment_id, notified_date, notification_type)`
-  * 万が一Cronバッチが同日に複数回実行されても、同一支払に対する同日の同じ通知種別はDB制約により二重登録・二重送信されない。
+  * LINE API呼び出し前に `delivery_status = 'PENDING'` で原子的に送信権を予約することで、バッチ多重起動時の二重送信を防止する。
 
 ---
 
@@ -149,21 +157,24 @@ CronバッチによるLINE通知の送信履歴を記録し、**同日の二重�
     "estimated_completion_date": "2027-10-29"
   },
   "current_payment": {
-    "id": "p1a2b3c4-0000-4000-8000-000000000009",
+    "id": "d1a2b3c4-0000-4000-8000-000000000009",
     "installment_number": 9,
     "target_year": 2026,
     "target_month": 11,
     "due_date": "2026-11-30",
     "expected_amount": 100000,
+    "paid_amount": 0,
     "status": "OVERDUE",
     "overdue_days": 3,
     "late_fee_amount": 120,
     "total_billing_amount": 100120,
+    "remaining_billing_amount": 100120,
+    "report_note": null,
     "reported_at": null
   },
   "payments": [
     {
-      "id": "p1a2b3c4-0000-4000-8000-000000000009",
+      "id": "d1a2b3c4-0000-4000-8000-000000000009",
       "installment_number": 9,
       "target_year": 2026,
       "target_month": 11,
@@ -171,16 +182,20 @@ CronバッチによるLINE通知の送信履歴を記録し、**同日の二重�
       "expected_amount": 100000,
       "paid_amount": 0,
       "status": "OVERDUE",
+      "report_note": null,
       "reported_at": null,
       "approved_at": null
     }
   ]
 }
 ```
+※債権者は本エンドポイント（`GET /api/v1/contracts/:id/summary`）の `current_payment.report_note` および `payments[].report_note` から、支払者が報告時に入力したメモ（承認前・承認後とも保持）を取得・確認できる。
 
 ---
 
 ### 2.2 `POST /api/v1/payments/:id/report`（支払い報告）
+
+リクエストで受け取った `note` は `payments.report_note` カラムに永続化される。
 
 #### Request Body
 ```json
@@ -192,8 +207,9 @@ CronバッチによるLINE通知の送信履歴を記録し、**同日の二重�
 #### Response (`200 OK`)
 ```json
 {
-  "id": "p1a2b3c4-0000-4000-8000-000000000009",
+  "id": "d1a2b3c4-0000-4000-8000-000000000009",
   "status": "REPORTED",
+  "report_note": "11月分（第9回）、給与口座より振込完了しました",
   "reported_at": "2026-11-30T10:15:00+09:00",
   "message": "振込報告を受け付けました。債権者の着金確認をお待ちください。"
 }
@@ -203,6 +219,13 @@ CronバッチによるLINE通知の送信履歴を記録し、**同日の二重�
 
 ### 2.3 `PATCH /api/v1/payments/:id/approve`（着金承認・差し戻し）
 
+#### 承認および充当ルール
+1. **充当順序**: 承認された入金額（`paid_amount`）は、民法第489条（法定充当）に準拠し、**① 遅延損害金（`late_fee_amount`） → ② 元本（`expected_amount`）** の順で充当する。
+2. **完済判定と未払残額の追跡**:
+   - 累計支払額（`payments.paid_amount`）が承認時点の合計請求額（`total_billing_amount = expected_amount + late_fee_amount`）に達し、**遅延損害金と元本がともに完済した場合のみ `PAID` へ遷移**する。
+   - 充当後に未払い残額（`remaining_billing_amount = total_billing_amount - paid_amount > 0`）が残る一部入金の場合は、`payments.paid_amount` に着金額を加算記録した上で **`PAID` へは遷移させず**、現在日が期日内であれば `PENDING`、期日超過であれば `OVERDUE` に遷移させて未払残額を引き続き追跡する。
+3. **差し戻し（`REJECT`）**: 着金が確認できない虚偽報告等の場合は `"action": "REJECT"` を指定し、`PENDING`（期日超過時は `OVERDUE`）へ差し戻す。
+
 #### Request Body
 ```json
 {
@@ -210,14 +233,14 @@ CronバッチによるLINE通知の送信履歴を記録し、**同日の二重�
   "paid_amount": 100000
 }
 ```
-※着金が確認できない虚偽報告等の場合は `"action": "REJECT"` を指定し、`PENDING`（期日超過時は `OVERDUE`）へ差し戻す。
 
 #### Response (`200 OK`)
 ```json
 {
-  "id": "p1a2b3c4-0000-4000-8000-000000000009",
+  "id": "d1a2b3c4-0000-4000-8000-000000000009",
   "status": "PAID",
   "paid_amount": 100000,
+  "remaining_billing_amount": 0,
   "approved_at": "2026-11-30T15:00:00+09:00"
 }
 ```
@@ -243,7 +266,7 @@ GitHub Actions の定期実行（毎日朝 9:00 JST）から叩かれるバッ�
   "processed_count": 1,
   "sent_notifications": [
     {
-      "payment_id": "p1a2b3c4-0000-4000-8000-000000000009",
+      "payment_id": "d1a2b3c4-0000-4000-8000-000000000009",
       "notification_type": "DUE_TODAY",
       "delivery_status": "SENT"
     }
@@ -287,7 +310,7 @@ GitHub Actions の定期実行（毎日朝 9:00 JST）から叩かれるバッ�
 |                                                                       |
 |  📜 支払いスケジュール・履歴一覧（2026年3月〜2027年10月）               |
 |  | 回数 | 対象年月 | 支払期日(営業日) | 金額     | ステータス | 操作   | |
-|  | #10  | 2026/12  | 2026-12-30 (水)  | ¥100,000 | PENDING    | -      | |
+|  | #10  | 2026/12  | 2026-12-31 (木)  | ¥100,000 | PENDING    | -      | |
 |  | #9   | 2026/11  | 2026-11-30 (月)  | ¥100,000 | OVERDUE 🔥 | 報告   | |
 |  | #8   | 2026/10  | 2026-10-30 (金)  | ¥100,000 | PAID ✅    | 完了   | |
 |  | ...  | ...      | ...              | ...      | ...        | ...    | |
@@ -328,14 +351,14 @@ GitHub Actions の定期実行（毎日朝 9:00 JST）から叩かれるバッ�
    - 土曜日（`Weekday == Saturday`）
    - 日曜日（`Weekday == Sunday`）
    - 内閣府が定める「国民の祝日」（振替休日・国民の休日を含む）
-   - ※オプション拡張：12月31日が平日の場合でも銀行休業日（12/31〜1/3）として12月30日以前の営業日に前倒し可能とする。
+   - ※オプション拡張：12月31日が平日の場合でも銀行休業日（12/31〜1/3）として12月30日以前の営業日に前倒し可能とする（標準ルールでは `2026-12-31 (木)`、銀行休業日拡張を有効にした場合は `2026-12-30 (水)`）。
 
 #### 境界値テストケース（Unit Test で検証必須のケース）
 - **通常月末平日**: `2026年11月` → 11月30日（月）が平日のため **`2026-11-30`**
 - **月末が日曜**: `2026年5月` → 5月31日（日）、5月30日（土）のため **`2026-05-29（金）`**
 - **月末が土曜**: `2026年10月` → 10月31日（土）のため **`2026-10-30（金）`**
 - **閏年の2月**: `2028年2月` → 閏年のため最終日は **`2028-02-29（火）`**（平年2026年2月は2/28が土曜のため **`2026-02-27（金）`**）
-- **月末が祝日＋週末の連休**: 月末金曜が祝日の場合、木曜まで2日以上前倒しされること。
+- **月末が祝日＋週末の連休**: 月末の金曜日である `2026年7月31日（金）` を祝日として注入したテストケースにおいて、前倒し日数1日で前日の木曜日である **`2026-07-30（木）`** が期待値として返ること。
 
 ---
 
@@ -349,9 +372,9 @@ stateDiagram-v2
     PENDING --> REPORTED : 支払者が「振込報告」
     PENDING --> OVERDUE : 期日超過（現在日 > due_date）
     OVERDUE --> REPORTED : 延滞後に支払者が「振込報告」
-    REPORTED --> PAID : 債権者が着金確認し「承認 (APPROVE)」
-    REPORTED --> PENDING : 債権者が「差し戻し (REJECT)」(期日内)
-    REPORTED --> OVERDUE : 債権者が「差し戻し (REJECT)」(期日超過後)
+    REPORTED --> PAID : 債権者が「承認 (APPROVE)」(損害金＋元本が完済)
+    REPORTED --> PENDING : 債権者が「差し戻し」または「一部入金承認」(期日内・残額あり)
+    REPORTED --> OVERDUE : 債権者が「差し戻し」または「一部入金承認」(期日超過・残額あり)
     PAID --> [*]
 ```
 
@@ -369,27 +392,51 @@ stateDiagram-v2
       遅延損害金 = 0
   それ以外の場合:
       延滞日数 = (現在日 - due_date) の日数
-      // 整数演算で浮動小数点誤差を防ぐ: (元本 * 年利(万分率) * 延滞日数) / (365 * 10000)
-      遅延損害金 = Floor(expected_amount * late_fee_rate * 延滞日数 / 365) // 1円未満切り捨て
+      未払元本 = Max(0, expected_amount - 元本充当済額)
+      // 整数演算で浮動小数点誤差を防ぐ: (未払元本 * 年利(万分率) * 延滞日数) / (365 * 10000)
+      遅延損害金 = Floor(未払元本 * late_fee_rate * 延滞日数 / 365) // 1円未満切り捨て
   ```
 
-#### エッジケース3：Cron通知バッチの二重送信防止（冪等性疑似コード）
+#### エッジケース3：Cron通知バッチの二重送信防止・再試行・回復設計（冪等性疑似コード）
+- **原子的予約と状態区別**: LINE Messaging API を呼び出す**前**に、`notification_logs` の複合ユニーク制約 `UNIQUE (payment_id, notified_date, notification_type)` を利用して `delivery_status = 'PENDING'` で送信権を原子的に確保する。
+- **既存ログの状態別ハンドリング**:
+  - `SENT`（送信成功済）または `PENDING`（他ワーカーが送信処理中）: 二重送信防止のため**スキップ**する。
+  - `FAILED`（明示的な送信失敗）: **再試行対象**として扱い、`WHERE id = log.id AND delivery_status = 'FAILED'` の条件付きUPDATEで `delivery_status = 'PENDING'`, `retry_count = retry_count + 1`, `line_retry_key = 新規UUID`, `updated_at = NOW()` に更新して送信権を再確保する。
+  - `UNKNOWN`（通信タイムアウト等で送信結果が不明）: **回復対象**として扱い、新規キーを発行せず**既存ログに保存されている同一の `line_retry_key`（UUID）を維持**したまま `WHERE id = log.id AND delivery_status = 'UNKNOWN'` で `delivery_status = 'PENDING'`, `retry_count = retry_count + 1` に更新する。LINE Messaging API 呼び出し時に `X-Line-Retry-Key: <line_retry_key>` ヘッダーを付与することで、LINE API側の冪等性保証により「前回すでに到達していた場合は二重配信せず `409 Conflict`（到達済として `SENT` へ回復）、未到達だった場合は通常配信（`200 OK` で `SENT` へ更新）」と安全に復旧できる。
+- **延滞ステータス更新時の競合防止**: 取得時の状態だけで更新せず、書き込み時点でも `WHERE id = payment.id AND status = 'PENDING' AND due_date < 実行日` の条件付き更新（または `SELECT ... FOR UPDATE` 行ロック）で検証する。報告・承認により `PAID`（または `REPORTED`）へ遷移していた支払いは、延滞更新および督促通知の対象から除外する。
+
 ```text
 関数 ExecuteDailyNotificationBatch(実行日):
-  1. 通知対象の支払レコードを取得する:
+  1. 通知候補の支払レコードを取得する:
      条件A (期日当日): due_date == 実行日 かつ status == 'PENDING'
      条件B (延滞督促): due_date < 実行日 かつ status IN ('PENDING', 'OVERDUE')
 
-  2. 各支払レコード payment についてループ:
-     a. notification_type = (due_date == 実行日) ? 'DUE_TODAY' : 'OVERDUE_REMIND'
-     b. notification_logs に (payment.id, 実行日, notification_type) が既に存在するか確認
-     c. 既に存在する場合:
-          スキップ（二重送信防止）
-     d. 存在しない場合:
-          - もし status == 'PENDING' かつ due_date < 実行日 ならば:
-              payment.status を 'OVERDUE' に更新
-          - LINE Messaging API で催促メッセージを送信
-          - notification_logs に送信履歴を INSERT（UNIQUE制約で競合時も保護）
+  2. 各候補レコード payment についてループ:
+     a. notification_type = (payment.due_date == 実行日) ? 'DUE_TODAY' : 'OVERDUE_REMIND'
+
+     b. [送信権の原子的予約 / 再試行判定]
+        - notification_logs に (payment.id, 実行日, notification_type) で新規 INSERT (delivery_status='PENDING', line_retry_key=新規UUID) を試みる
+        - UNIQUE制約競合（既存ログあり）の場合、既存ログの delivery_status を確認:
+          * 'SENT' または 'PENDING' -> スキップ（二重送信防止）
+          * 'FAILED' -> WHERE delivery_status = 'FAILED' で delivery_status='PENDING', retry_count=retry_count+1, line_retry_key=新規UUID に条件付きUPDATE（更新0件ならスキップ）
+          * 'UNKNOWN' -> WHERE delivery_status = 'UNKNOWN' で delivery_status='PENDING', retry_count=retry_count+1 に条件付きUPDATE（既存の line_retry_key を維持、更新0件ならスキップ）
+
+     c. [支払ステータスの最新検証と条件付き延滞更新]
+        - トランザクション内で payments レコードを再検証（SELECT ... FOR UPDATE）:
+          * もし最新 status が 'PAID' または 'REPORTED' に遷移していた場合:
+              予約した notification_logs を削除（またはキャンセル）し、更新・督促対象から除外してスキップ
+          * もし payment.due_date < 実行日 かつ 最新 status == 'PENDING' の場合:
+              UPDATE payments SET status = 'OVERDUE', updated_at = NOW()
+              WHERE id = payment.id AND status = 'PENDING' AND due_date < 実行日
+
+     d. [外部API呼び出し（外部冪等キー付与）と結果記録]
+        - ヘッダー X-Line-Retry-Key に log.line_retry_key を設定し、LINE Messaging API でメッセージを送信
+        - レスポンスが 200 OK または 409 Conflict（同一Retry-Keyで到達済）の場合:
+            UPDATE notification_logs SET delivery_status = 'SENT', updated_at = NOW() WHERE id = log.id
+        - レスポンスが 4xx/5xx 等の明示的エラーの場合:
+            UPDATE notification_logs SET delivery_status = 'FAILED', updated_at = NOW() WHERE id = log.id
+        - ネットワークタイムアウト等で送信成否が不明な場合:
+            UPDATE notification_logs SET delivery_status = 'UNKNOWN', updated_at = NOW() WHERE id = log.id
 ```
 
 ---
