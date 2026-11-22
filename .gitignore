@@ -9,6 +9,7 @@
 !.env.example
 
 # Go
+/backend/api
 backend/bin/
 backend/tmp/
 *.exe
