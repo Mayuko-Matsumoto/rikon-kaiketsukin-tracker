@@ -9,6 +9,8 @@ import (
 type HolidayChecker func(date time.Time) bool
 
 var (
+	// ErrInvalidYear は 1 未満の不正な年が指定された場合のエラー。
+	ErrInvalidYear = errors.New("invalid year: must be >= 1")
 	// ErrInvalidMonth は 1月〜12月 以外の月が指定された場合のエラー。
 	ErrInvalidMonth = errors.New("invalid month: must be between January and December")
 	// ErrNoBusinessDay は対象月内に営業日が1日も見つからなかった場合のエラー（無限ループ防止）。
@@ -19,22 +21,38 @@ var (
 // 月末日が土曜日・日曜日・祝日（isHoliday が true）の場合は、直前の平日に前倒しする。
 // loc が nil の場合は JST（Asia/Tokyo, UTC+9）を使用する。
 func CalculateDueDate(year int, month time.Month, loc *time.Location, isHoliday HolidayChecker) (time.Time, error) {
-	// 1. バリデーション：month が time.January 未満 または time.December より大きい場合
-	//    ゼロ値の time.Time{} と ErrInvalidMonth を返す
+	// 1. バリデーション：不正な年・月を弾く
+	if year < 1 {
+		return time.Time{}, ErrInvalidYear
+	}
+	if month < time.January || month > time.December {
+		return time.Time{}, ErrInvalidMonth
+	}
 
-	// 2. タイムゾーンのデフォルト設定：loc が nil の場合
-	//    time.FixedZone("Asia/Tokyo", 9*60*60) を loc にセットする
+	// 2. タイムゾーンのデフォルト設定：loc が nil の場合は JST（UTC+9）をセットする
+	if loc == nil {
+		loc = time.FixedZone("Asia/Tokyo", 9*60*60)
+	}
 
 	// 3. 対象年・月の「暦上の最終日（月末日）」を生成する
-	//    ヒント: time.Date(year, month+1, 0, 0, 0, 0, 0, loc)
+	dueDate := time.Date(year, month+1, 0, 0, 0, 0, 0, loc)
 
 	// 4. ループ処理：判定日が「土日」または「祝日」である間、1日ずつ前倒しする
-	//    4-1. 判定日の曜日（Weekday()）が 土曜(time.Saturday) または 日曜(time.Sunday) か判定
-	//    4-2. isHoliday が nil でなく、かつ isHoliday(判定日) が true か判定
-	//    4-3. 土日でも祝日でもなければ（平日なら）ループを抜ける
-	//    4-4. 判定日を 1日前（AddDate(0, 0, -1)）に更新する
-	//    4-5. もし前倒しした結果、月が変わってしまったら（判定日.Month() != month）
-	//         無限ループ・前月跨ぎ防止のため time.Time{} と ErrNoBusinessDay を返す
+	for {
+		weekday := dueDate.Weekday()
+		isWeekend := weekday == time.Saturday || weekday == time.Sunday
+		holiday := isHoliday != nil && isHoliday(dueDate)
+
+		if !isWeekend && !holiday {
+			break
+		}
+
+		dueDate = dueDate.AddDate(0, 0, -1)
+		if dueDate.Month() != month {
+			return time.Time{}, ErrNoBusinessDay
+		}
+	}
 
 	// 5. 確定した支払期日と nil（エラーなし）を返す
+	return dueDate, nil
 }
